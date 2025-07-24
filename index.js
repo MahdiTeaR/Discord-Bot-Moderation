@@ -1,6 +1,9 @@
 require('dotenv').config();
 const { Client, GatewayIntentBits, SlashCommandBuilder, EmbedBuilder, Routes, ActivityType, PermissionsBitField } = require('discord.js');
 const { REST } = require('@discordjs/rest');
+const fs = require('fs');
+const path = require('path');
+const PUNISHMENTS_FILE = path.join(__dirname, 'punishments.json');
 
 const client = new Client({
   intents: [
@@ -27,7 +30,7 @@ const notificationChannelId = '1353661830777671701';
 const targetRoleId = '1277164177617584180';
 const voiceJoinTimers = new Map();
 const notificationMessages = new Map(); // Store notification messages
-const punishmentHistory = new Map(); // Store punishment history
+const punishmentHistory = loadPunishments(); // Store punishment history
 const punishmentLimits = new Map(); // Store punishment limits for moderators
 
 
@@ -178,6 +181,7 @@ function recordPunishment(userId, moderatorId, punishmentType, reason = null, du
     timestamp: new Date(),
   });
   punishmentHistory.set(userId, history);
+  savePunishments(punishmentHistory); // ذخیره پس از هر تغییر
   updatePunishmentCount(moderatorId, punishmentType); // Update punishment count for rate limiting
 }
 
@@ -1209,6 +1213,28 @@ async function updateInviteCache(guild) {
     });
   } catch (error) {
     console.error('Error updating invite cache:', error);
+  }
+}
+
+
+function loadPunishments() {
+  if (fs.existsSync(PUNISHMENTS_FILE)) {
+    try {
+      const data = fs.readFileSync(PUNISHMENTS_FILE, 'utf8');
+      return new Map(JSON.parse(data));
+    } catch (e) {
+      console.error('Error reading punishments file:', e);
+      return new Map();
+    }
+  }
+  return new Map();
+}
+
+function savePunishments(map) {
+  try {
+    fs.writeFileSync(PUNISHMENTS_FILE, JSON.stringify([...map]), 'utf8');
+  } catch (e) {
+    console.error('Error writing punishments file:', e);
   }
 }
 
