@@ -1,5 +1,5 @@
 require('dotenv').config();
-const { Client, GatewayIntentBits, SlashCommandBuilder, EmbedBuilder, Routes, ActivityType, PermissionsBitField } = require('discord.js');
+const { Client, GatewayIntentBits, SlashCommandBuilder, EmbedBuilder, Routes, ActivityType, PermissionsBitField, ActionRowBuilder, ButtonBuilder, ButtonStyle, ChannelType, Partials } = require('discord.js');
 const { REST } = require('@discordjs/rest');
 const fs = require('fs');
 const path = require('path');
@@ -7,14 +7,15 @@ const PUNISHMENTS_FILE = path.join(__dirname, 'punishments.json');
 
 const client = new Client({
   intents: [
-    1, // Guilds
-    2, // GuildMembers
-    4096, // GuildMessages
-    32, // GuildInvites
-    32768, // MessageContent
-    4, // GuildPresences
-    128 // VoiceStates
+    GatewayIntentBits.Guilds,
+    GatewayIntentBits.GuildMembers,
+    GatewayIntentBits.GuildMessages,
+    GatewayIntentBits.GuildInvites,
+    GatewayIntentBits.GuildVoiceStates,
+    GatewayIntentBits.GuildPresences,
+    GatewayIntentBits.DirectMessages,
   ],
+  partials: [Partials.Channel],
 });
 
 // Load environment variables
@@ -22,6 +23,14 @@ const DISCORD_BOT_TOKEN = process.env.DISCORD_BOT_TOKEN;
 const DISCORD_GUILD_ID = process.env.DISCORD_GUILD_ID;
 const MUTE_ROLE_NAME = process.env.MUTE_ROLE_NAME || 'Muted';
 const LOG_CHANNEL_ID = process.env.LOG_CHANNEL_ID; // Use environment variable for log channel ID
+
+if (!DISCORD_BOT_TOKEN) {
+  console.error('Missing DISCORD_BOT_TOKEN in .env');
+  process.exit(1);
+}
+if (!DISCORD_GUILD_ID) {
+  console.warn('DISCORD_GUILD_ID is not set. Commands will not be registered to a guild.');
+}
 
 // --- Configuration ---
 const logChannelId = LOG_CHANNEL_ID || '1353200425536323665'; // Default log channel ID if not in .env
@@ -39,6 +48,7 @@ const mutedUsers = new Set();
 const timeoutUsers = new Set();
 let botStartTime; // Variable to store bot start time
 const inviteCache = new Map(); // Cache to store invites
+const memberJoinInviteMap = new Map(); // Store inviter info per userId for leave logs
 
 // Command definitions
 const commands = [
@@ -80,8 +90,18 @@ const commands = [
     if (command.name === 'timeout') {
       builder.addIntegerOption(option => option.setName('duration').setDescription('Duration in minutes').setRequired(true));
     }
+    if (command.name === 'mute') {
+      builder.addIntegerOption(option => option.setName('duration').setDescription('Duration in days (optional, permanent if omitted)').setRequired(false));
+    }
   }
   else if (['ban', 'kick', 'unban', 'unmute', 'untimeout', 'lockchannel', 'unlockchannel'].includes(command.name)) { // Added lockchannel and unlockchannel
+    if (['ban', 'kick', 'unmute', 'untimeout'].includes(command.name)) {
+      builder.addUserOption(option => option.setName('user').setDescription('The user to target').setRequired(true));
+    }
+    if (command.name === 'unban') {
+      builder.addUserOption(option => option.setName('user').setDescription('The user to unban (optional)').setRequired(false));
+      builder.addStringOption(option => option.setName('userid').setDescription('User ID to unban (optional if user provided)').setRequired(false));
+    }
     builder.addStringOption(option => option.setName('reason').setDescription('Reason for action').setRequired(false)); // Reason is now optional for ban, kick, unban, unmute, untimeout, lockchannel, unlockchannel
     if (command.name === 'ban') {
       builder.addIntegerOption(option => option.setName('duration').setDescription('Duration in days').setRequired(false));
@@ -97,6 +117,10 @@ const rest = new REST({ version: '10' }).setToken(DISCORD_BOT_TOKEN);
 // Function to register commands
 async function registerCommands() {
   try {
+    if (!DISCORD_GUILD_ID || !client.user) {
+      console.warn('Skipping command registration: missing DISCORD_GUILD_ID or client not ready.');
+      return;
+    }
     await rest.put(
       Routes.applicationGuildCommands(client.user.id, DISCORD_GUILD_ID),
       { body: commands },
@@ -106,19 +130,48 @@ async function registerCommands() {
   }
 }
 
-// Function to send log messages
-async function sendLogMessage(logChannelId, embed) {
+// Function to send log messages (supports optional files)
+async function sendLogMessage(logChannelId, embed = null, files = null) {
   if (!logChannelId) {
     console.error('sendLogMessage: No logChannelId provided.');
     return;
   }
-  const logChannel = client.channels.cache.get(logChannelId);
+  let logChannel = client.channels.cache.get(logChannelId);
   if (!logChannel) {
-    console.error('sendLogMessage: Log channel not found:', logChannelId);
-    return;
+    try {
+      logChannel = await client.channels.fetch(logChannelId);
+    } catch (e) {
+      console.error('sendLogMessage: Log channel not found:', logChannelId);
+      return;
+    }
   }
+  // Ensure the target is a text-based channel and we have permissions
   try {
-    await logChannel.send({ embeds: [embed] });
+    if (typeof logChannel.isTextBased === 'function' && !logChannel.isTextBased()) {
+      console.error('sendLogMessage: Target channel is not text-based:', logChannelId);
+      return;
+    }
+    if (logChannel.guild) {
+      const me = logChannel.guild.members.me;
+      if (me) {
+        const perms = logChannel.permissionsFor(me);
+        const needed = [PermissionsBitField.Flags.ViewChannel, PermissionsBitField.Flags.SendMessages];
+        if (embed) needed.push(PermissionsBitField.Flags.EmbedLinks);
+        if (files && files.length) needed.push(PermissionsBitField.Flags.AttachFiles);
+        if (!perms || !perms.has(needed)) {
+          console.error('sendLogMessage: Missing permissions to send embeds in log channel:', logChannelId);
+          return;
+        }
+      }
+    }
+    const payload = {};
+    if (embed) payload.embeds = [embed];
+    if (files && files.length) payload.files = files;
+    if (!payload.embeds && !payload.files) {
+      console.error('sendLogMessage: Nothing to send');
+      return;
+    }
+    await logChannel.send(payload);
   } catch (error) {
     console.error('sendLogMessage: Error sending log message:', error);
   }
@@ -138,7 +191,15 @@ function createLogEmbed(interaction, title, color, fields = [], startTime = null
   if (startTime) fields.push({ name: 'Start Time', value: String(startTime) });
   if (endTime) fields.push({ name: 'End Time', value: String(endTime) });
   if (reason) fields.push({ name: 'Reason', value: String(reason) });
-  embed.addFields(fields.map(field => ({ name: field.name, value: String(field.value) })));
+  // Clamp to Discord limits: max 25 fields, name<=256, value<=1024
+  embed.addFields(
+    fields
+      .slice(0, 25)
+      .map(field => ({
+        name: String(field.name).slice(0, 256),
+        value: String(field.value).slice(0, 1024),
+      }))
+  );
   return embed;
 }
 
@@ -151,15 +212,24 @@ function createResponseEmbed(interaction, description, color = '#00FF00', fields
   if (interaction) {
     fields.push({ name: 'Moderator', value: String(`${interaction.user.tag} (${interaction.user.id})`) });
   }
-  if (reason) fields.push({ name: 'دلیل', value: String(reason) });
-  embed.addFields(fields.map(field => ({ name: field.name, value: String(field.value) })));
+  if (reason) fields.push({ name: 'Reason', value: String(reason) });
+  // Clamp to Discord limits: max 25 fields, name<=256, value<=1024
+  embed.addFields(
+    fields
+      .slice(0, 25)
+      .map(field => ({
+        name: String(field.name).slice(0, 256),
+        value: String(field.value).slice(0, 1024),
+      }))
+  );
   return embed;
 }
 
 // --- DM Message Function ---
-async function sendDmEmbed(user, embed) {
+async function sendDmEmbed(user, embed, components = null) {
   try {
-    await user.send({ embeds: [embed] });
+    const payload = components && components.length ? { embeds: [embed], components } : { embeds: [embed] };
+    await user.send(payload);
     return true;
   } catch (error) {
     if (error.code === 50007) {
@@ -181,7 +251,7 @@ function recordPunishment(userId, moderatorId, punishmentType, reason = null, du
     timestamp: new Date(),
   });
   punishmentHistory.set(userId, history);
-  savePunishments(punishmentHistory); // ذخیره پس از هر تغییر
+  savePunishments(punishmentHistory); // save after each change
   updatePunishmentCount(moderatorId, punishmentType); // Update punishment count for rate limiting
 }
 
@@ -205,23 +275,30 @@ function updatePunishmentCount(moderatorId, punishmentType) {
 
 // --- Command Handlers ---
 async function handleTimeout(interaction, member, user, duration, reason) {
+  const meTimeout = interaction.guild.members.me;
+  if (!meTimeout || !meTimeout.permissions.has(PermissionsBitField.Flags.ModerateMembers)) {
+    return interaction.reply({ embeds: [createResponseEmbed(interaction, 'I do not have the Moderate Members permission.', '#FF0000')], ephemeral: true });
+  }
   if (checkPunishmentRateLimit(interaction.user.id, 'Timeout')) {
-    return interaction.reply({ content: 'شما در یک ساعت گذشته 3 بار تنبیه انجام داده‌اید. لطفا یک ساعت دیگر صبر کنید.', ephemeral: true });
+    return interaction.reply({ embeds: [createResponseEmbed(interaction, 'You have reached the limit of 3 punishments in the past hour. Please wait one hour.', '#FFA500')], ephemeral: true });
   }
   if (!reason) {
-    return interaction.reply({ content: 'وارد کردن دلیل برای Timeout الزامی است.', ephemeral: true });
+    return interaction.reply({ embeds: [createResponseEmbed(interaction, 'A reason is required for Timeout.', '#FF0000')], ephemeral: true });
   }
   if (user.bot) {
-    return interaction.reply({ content: 'ربات ها رو نمیتونی Timeout کنی.', ephemeral: true });
+    return interaction.reply({ embeds: [createResponseEmbed(interaction, 'You cannot timeout bots.', '#FF0000')], ephemeral: true });
   }
   if (user.id === client.user.id) {
-    return interaction.reply({ content: 'من را نمیتونی Timeout کنی.', ephemeral: true });
+    return interaction.reply({ embeds: [createResponseEmbed(interaction, 'You cannot timeout me.', '#FF0000')], ephemeral: true });
   }
   if (user.id === interaction.user.id) {
-    return interaction.reply({ content: 'خودتو نمیتونی Timeout کنی.', ephemeral: true });
+    return interaction.reply({ embeds: [createResponseEmbed(interaction, 'You cannot timeout yourself.', '#FF0000')], ephemeral: true });
   }
   if (member.isCommunicationDisabled()) {
-    return interaction.reply({ content: 'کاربر از قبل Timeout شده است.', ephemeral: true });
+    return interaction.reply({ embeds: [createResponseEmbed(interaction, 'The user is already timed out.', '#FFA500')], ephemeral: true });
+  }
+  if (member && member.moderatable === false) {
+    return interaction.reply({ embeds: [createResponseEmbed(interaction, 'Cannot timeout this user (role hierarchy).', '#FF0000')], ephemeral: true });
   }
 
   const startTime = new Date();
@@ -231,30 +308,42 @@ async function handleTimeout(interaction, member, user, duration, reason) {
     timeoutUsers.add(user.id); // Add user to timeoutUsers
     recordPunishment(user.id, interaction.user.id, 'Timeout', reason, duration); // Record punishment
 
-    const responseEmbed = createResponseEmbed(interaction, 'کاربر با موفقیت Timeout شد.', '#00FF00', [
-      { name: 'کاربر', value: `${user.tag} (${user.id})` },
-      { name: 'مدت زمان', value: String(duration) + ' دقیقه' },
+    const responseEmbed = createResponseEmbed(interaction, 'User has been timed out successfully.', '#00FF00', [
+      { name: 'User', value: `${user.tag} (${user.id})` },
+      { name: 'Duration', value: String(duration) + ' minutes' },
     ], reason);
 
-    const logEmbed = createLogEmbed(interaction, 'Timeout کاربر', '#FF0000', [
-      { name: 'کاربر', value: `${user.tag} (${user.id})` },
-      { name: 'مدت زمان', value: String(duration) + ' دقیقه' },
-      { name: 'دلیل', value: reason || 'بدون دلیل' },
+    const logEmbed = createLogEmbed(interaction, 'User Timeout', '#FF0000', [
+      { name: 'User', value: `${user.tag} (${user.id})` },
+      { name: 'Duration', value: String(duration) + ' minutes' },
+      { name: 'Reason', value: reason || 'No reason provided' },
     ], startTime.toLocaleTimeString(), endTime.toLocaleTimeString());
 
     const dmEmbed = new EmbedBuilder()
       .setColor('#FFA500')
-      .setTitle('Timeout در سرور')
-      .setDescription(`شما به مدت ${duration} دقیقه در سرور Timeout شدید.`)
+      .setTitle('Server Timeout')
+      .setDescription(`You have been timed out on the server for ${duration} minutes.`)
       .addFields([
-        { name: 'دلیل', value: reason },
-        { name: 'پایان Timeout', value: endTime.toLocaleTimeString() }
+        { name: 'Reason', value: reason },
+        { name: 'Timeout Ends', value: endTime.toLocaleTimeString() }
       ])
       .setTimestamp();
 
-    await interaction.reply({ embeds: [responseEmbed] });
+    if (interaction.deferred || interaction.replied) {
+      await interaction.editReply({ embeds: [responseEmbed] });
+    } else {
+      await interaction.reply({ embeds: [responseEmbed] });
+    }
     await sendLogMessage(logChannelId, logEmbed);
-    sendDmEmbed(user, dmEmbed);
+    const dmResult = await sendDmEmbed(user, dmEmbed);
+    if (dmResult !== true) {
+      const dmBlockedLog = createLogEmbed(interaction, 'DM Delivery Failed', '#FFA500', [
+        { name: 'User', value: `<@${user.id}> ${user.username}` },
+        { name: 'Context', value: 'Timeout notification' },
+        { name: 'Detail', value: 'Failed to send a DM due to user privacy settings or other error.' },
+      ]);
+      await sendLogMessage(logChannelId, dmBlockedLog);
+    }
 
     setTimeout(async () => {
       try {
@@ -262,15 +351,15 @@ async function handleTimeout(interaction, member, user, duration, reason) {
           await member.timeout(null); // Remove timeout
           timeoutUsers.delete(user.id); // Remove user from timeoutUsers
           if (logChannelId) {
-            const untimeoutLogEmbed = createLogEmbed(null, 'رفع Timeout کاربر (خودکار)', '#008000', [
-              { name: 'کاربر', value: `${user.tag} (${user.id})` },
+            const untimeoutLogEmbed = createLogEmbed(null, 'User Timeout Removed (Automatic)', '#008000', [
+              { name: 'User', value: `${user.tag} (${user.id})` },
             ]);
             await sendLogMessage(logChannelId, untimeoutLogEmbed);
             // Send DM to user when timeout is lifted automatically
             const autoUntimeoutDmEmbed = new EmbedBuilder()
               .setColor('#008000')
-              .setTitle('رفع خودکار Timeout')
-              .setDescription('Timeout شما در سرور به صورت خودکار برداشته شد.');
+              .setTitle('Automatic Timeout Removal')
+              .setDescription('Your timeout was automatically removed.');
             sendDmEmbed(user, autoUntimeoutDmEmbed);
           }
         }
@@ -282,76 +371,98 @@ async function handleTimeout(interaction, member, user, duration, reason) {
 
   } catch (error) {
     console.error('Error executing timeout command:', error);
-    return interaction.reply({ content: 'هنگام اجرای فرمان Timeout خطایی رخ داد.', ephemeral: true });
+    return interaction.reply({ embeds: [createResponseEmbed(interaction, 'An error occurred while executing the Timeout command.', '#FF0000')], ephemeral: true });
   }
 }
 
 async function handleUntimeout(interaction, member, user, reason) {
+  const meUntimeout = interaction.guild.members.me;
+  if (!meUntimeout || !meUntimeout.permissions.has(PermissionsBitField.Flags.ModerateMembers)) {
+    return interaction.reply({ embeds: [createResponseEmbed(interaction, 'I do not have the Moderate Members permission.', '#FF0000')], ephemeral: true });
+  }
   if (user.bot) {
-    return interaction.reply({ content: 'ربات رو نمیتونی Untimeout کنی.', ephemeral: true });
+    return interaction.reply({ embeds: [createResponseEmbed(interaction, 'You cannot untimeout a bot.', '#FF0000')], ephemeral: true });
   }
   if (user.id === client.user.id) {
-    return interaction.reply({ content: 'من رو نمیتونی Untimeout کنی.', ephemeral: true });
+    return interaction.reply({ embeds: [createResponseEmbed(interaction, 'You cannot untimeout me.', '#FF0000')], ephemeral: true });
   }
   if (user.id === interaction.user.id) {
-    return interaction.reply({ content: 'خودتو نمیتونی Untimeout کنی.', ephemeral: true });
+    return interaction.reply({ embeds: [createResponseEmbed(interaction, 'You cannot untimeout yourself.', '#FF0000')], ephemeral: true });
   }
   if (!member.isCommunicationDisabled()) {
-    return interaction.reply({ content: 'کاربر Timeout نیست.', ephemeral: true });
+    return interaction.reply({ embeds: [createResponseEmbed(interaction, 'The user is not timed out.', '#FFA500')], ephemeral: true });
   }
   try {
     await member.timeout(null, reason);
     timeoutUsers.delete(user.id); // Remove user from timeoutUsers
+    recordPunishment(user.id, interaction.user.id, 'Untimeout', reason);
 
-    const responseEmbed = createResponseEmbed(interaction, 'Timeout کاربر با موفقیت برداشته شد.', '#00FF00', [
-      { name: 'کاربر', value: `${user.tag} (${user.id})` },
+    const responseEmbed = createResponseEmbed(interaction, 'User timeout has been removed successfully.', '#00FF00', [
+      { name: 'User', value: `${user.tag} (${user.id})` },
     ], reason); // Pass reason here
 
-    const logEmbed = createLogEmbed(interaction, 'رفع Timeout کاربر', '#008000', [
-      { name: 'کاربر', value: `${user.tag} (${user.id})` },
-      { name: 'دلیل', value: reason || 'بدون دلیل' },
+    const logEmbed = createLogEmbed(interaction, 'User Timeout Removed', '#008000', [
+      { name: 'User', value: `${user.tag} (${user.id})` },
+      { name: 'Reason', value: reason || 'No reason provided' },
     ], null, null, reason);
 
     const dmEmbed = new EmbedBuilder()
       .setColor('#008000')
-      .setTitle('رفع Timeout')
-      .setDescription('Timeout شما در سرور برداشته شد.')
+      .setTitle('Timeout Removed')
+      .setDescription('Your timeout has been removed.')
       .addFields([
-        { name: 'دلیل', value: reason || 'بدون دلیل' },
+        { name: 'Reason', value: reason || 'No reason provided' },
       ])
       .setTimestamp();
 
-    await interaction.reply({ embeds: [responseEmbed] });
+    if (interaction.deferred || interaction.replied) {
+      await interaction.editReply({ embeds: [responseEmbed] });
+    } else {
+      await interaction.reply({ embeds: [responseEmbed] });
+    }
     await sendLogMessage(logChannelId, logEmbed);
     sendDmEmbed(user, dmEmbed);
 
 
   } catch (error) {
     console.error('Error executing untimeout command:', error);
-    return interaction.reply({ content: 'هنگام اجرای فرمان رفع Timeout خطایی رخ داد.', ephemeral: true });
+    return interaction.reply({ embeds: [createResponseEmbed(interaction, 'An error occurred while executing the UnTimeout command.', '#FF0000')], ephemeral: true });
   }
 }
 
 async function handleMute(interaction, member, user, duration, reason) {
+  const meMute = interaction.guild.members.me;
+  if (!meMute || !meMute.permissions.has(PermissionsBitField.Flags.ManageRoles)) {
+    return interaction.reply({ embeds: [createResponseEmbed(interaction, 'I do not have the Manage Roles permission.', '#FF0000')], ephemeral: true });
+  }
+  if (checkPunishmentRateLimit(interaction.user.id, 'Mute')) {
+    return interaction.reply({ embeds: [createResponseEmbed(interaction, 'You have reached the limit of 3 punishments in the past hour. Please wait one hour.', '#FFA500')], ephemeral: true });
+  }
   if (!reason) {
-    return interaction.reply({ content: 'وارد کردن دلیل برای Mute الزامی است.', ephemeral: true });
+    return interaction.reply({ embeds: [createResponseEmbed(interaction, 'A reason is required for Mute.', '#FF0000')], ephemeral: true });
   }
   if (user.bot) {
-    return interaction.reply({ content: 'ربات ها رو نمیتونی Mute کنی.', ephemeral: true });
+    return interaction.reply({ embeds: [createResponseEmbed(interaction, 'You cannot mute bots.', '#FF0000')], ephemeral: true });
   }
   if (user.id === client.user.id) {
-    return interaction.reply({ content: 'من رو نمیتونی Mute کنی.', ephemeral: true });
+    return interaction.reply({ embeds: [createResponseEmbed(interaction, 'You cannot mute me.', '#FF0000')], ephemeral: true });
   }
   if (user.id === interaction.user.id) {
-    return interaction.reply({ content: 'خودتو نمیتونی Mute کنی.', ephemeral: true });
+    return interaction.reply({ embeds: [createResponseEmbed(interaction, 'You cannot mute yourself.', '#FF0000')], ephemeral: true });
   }
   const muteRole = interaction.guild.roles.cache.find(role => role.name === MUTE_ROLE_NAME);
   if (!muteRole) {
-    return interaction.reply({ content: `نقش Mute با نام "${MUTE_ROLE_NAME}" پیدا نشد.`, ephemeral: true });
+    return interaction.reply({ embeds: [createResponseEmbed(interaction, `Mute role named "${MUTE_ROLE_NAME}" was not found.`, '#FF0000')], ephemeral: true });
+  }
+  if (muteRole.comparePositionTo(meMute.roles.highest) >= 0) {
+    return interaction.reply({ embeds: [createResponseEmbed(interaction, 'The Mute role is higher or equal to my highest role and cannot be managed.', '#FF0000')], ephemeral: true });
+  }
+  if (member && !member.manageable) {
+    return interaction.reply({ embeds: [createResponseEmbed(interaction, 'Cannot apply the role to this user (role hierarchy).', '#FF0000')], ephemeral: true });
   }
 
   if (member.roles.cache.has(muteRole.id)) {
-    return interaction.reply({ content: 'کاربر از قبل Mute شده است.', ephemeral: true });
+    return interaction.reply({ embeds: [createResponseEmbed(interaction, 'The user is already muted.', '#FFA500')], ephemeral: true });
   }
 
   const startTime = new Date();
@@ -359,8 +470,8 @@ async function handleMute(interaction, member, user, duration, reason) {
   let muteDurationText = 'Permanent'; // Default mute duration text
 
   if (duration) {
-    endTime = new Date(startTime.getTime() + duration * 60 * 1000);
-    muteDurationText = String(duration) + ' دقیقه';
+    endTime = new Date(startTime.getTime() + duration * 24 * 60 * 60 * 1000);
+    muteDurationText = String(duration) + (duration === 1 ? ' day' : ' days');
   }
 
   try {
@@ -368,24 +479,25 @@ async function handleMute(interaction, member, user, duration, reason) {
     mutedUsers.add(user.id); // Add user to mutedUsers
     recordPunishment(user.id, interaction.user.id, 'Mute', reason, duration); // Record punishment
 
-    const responseEmbed = createResponseEmbed(interaction, `کاربر با موفقیت ${duration ? 'Mute' : 'Permanent Mute'} شد.`, '#00FF00', [
-      { name: 'کاربر', value: `${user.tag} (${user.id})` },
-      ...(duration ? [{ name: 'مدت زمان', value: muteDurationText }] : []), // Conditionally add duration field
-    ], reason);
+    const mention = `<@${user.id}>`;
+    const idSpoiler = `||${user.id}||`;
+    const durationPart = duration ? ` ${muteDurationText}` : '';
+    const desc = `User ${mention}  ${idSpoiler} has been muted successfully **${durationPart}** Reason **${reason}**`;
+    const responseEmbed = createResponseEmbed(null, desc, '#00FF00');
 
-    const logEmbed = createLogEmbed(interaction, `${duration ? 'Mute' : 'Permanent Mute'} کاربر`, '#FF0000', [
-      { name: 'کاربر', value: `${user.tag} (${user.id})` },
-      ...(duration ? [{ name: 'مدت زمان', value: muteDurationText }] : []), // Conditionally add duration field
-      { name: 'دلیل', value: reason },
-    ], startTime.toLocaleTimeString(), endTime ? endTime.toLocaleTimeString() : null); // endTime can be null for permanent mute
+    const logEmbed = createLogEmbed(interaction, `User ${duration ? 'Mute' : 'Permanent Mute'}`, '#FF0000', [
+      { name: 'User', value: `${user.tag} (${user.id})` },
+      ...(duration ? [{ name: 'Duration', value: muteDurationText }] : []), // Conditionally add duration field
+      { name: 'Reason', value: reason },
+    ], startTime.toLocaleString(), endTime ? endTime.toLocaleString() : null); // endTime can be null for permanent mute
 
     const dmEmbed = new EmbedBuilder()
       .setColor('#FF0000')
-      .setTitle(`${duration ? 'Mute' : 'Permanent Mute'} در سرور`)
-      .setDescription(`شما به مدت ${duration ? muteDurationText : 'دائمی'} در سرور Mute شدید.`)
+      .setTitle(`Server ${duration ? 'Mute' : 'Permanent Mute'}`)
+      .setDescription(`You have been ${duration ? `muted for **${muteDurationText}**` : 'permanently muted'} on the server.`)
       .addFields([
-        { name: 'دلیل', value: reason },
-        ...(duration ? [{ name: 'پایان Mute', value: endTime.toLocaleTimeString() }] : []), // Conditionally add end time field
+        { name: 'Reason', value: reason },
+        ...(duration ? [{ name: 'Mute Ends', value: endTime.toLocaleString() }] : []), // Conditionally add end time field
       ])
       .setTimestamp();
 
@@ -393,7 +505,12 @@ async function handleMute(interaction, member, user, duration, reason) {
     await sendLogMessage(logChannelId, logEmbed);
     const dmResult = await sendDmEmbed(user, dmEmbed);
     if (!dmResult) {
-      interaction.channel.send(`ارسال پیام دایرکت به ${user.tag} به دلیل تنظیمات حریم خصوصی کاربر ناموفق بود.`);
+      const dmBlockedLog = createLogEmbed(interaction, 'DM Delivery Failed', '#FFA500', [
+        { name: 'User', value: `<@${user.id}> ${user.username}` },
+        { name: 'Context', value: 'Mute notification' },
+        { name: 'Detail', value: 'Failed to send a DM due to user privacy settings.' },
+      ]);
+      await sendLogMessage(logChannelId, dmBlockedLog);
     }
 
     if (duration) { // Set timeout only if duration is provided
@@ -403,15 +520,15 @@ async function handleMute(interaction, member, user, duration, reason) {
             await member.roles.remove(muteRole);
             mutedUsers.delete(user.id); // Remove user from mutedUsers
             if (logChannelId) {
-              const unmuteLogEmbed = createLogEmbed(null, 'رفع Mute کاربر (خودکار)', '#008000', [
-                { name: 'کاربر', value: `${user.tag} (${user.id})` },
+              const unmuteLogEmbed = createLogEmbed(null, 'Mute Removed', '#008000', [
+                { name: 'User', value: `<@${user.id}> ${user.username} Mute Removed (Automatic)` },
               ]);
               await sendLogMessage(logChannelId, unmuteLogEmbed);
               // Send DM to user when mute is lifted automatically
               const autoUnmuteDmEmbed = new EmbedBuilder()
                 .setColor('#008000')
-                .setTitle('رفع خودکار Mute')
-                .setDescription('Mute شما در سرور به صورت خودکار برداشته شد.');
+                .setTitle('Automatic Unmute')
+                .setDescription('Your mute was automatically removed.');
               sendDmEmbed(user, autoUnmuteDmEmbed);
             }
           }
@@ -419,52 +536,57 @@ async function handleMute(interaction, member, user, duration, reason) {
           // Handle the error here
           console.error('Error during automatic unmute:', error); // Added error logging
         }
-      }, duration * 60 * 1000);
+      }, duration * 24 * 60 * 60 * 1000);
     }
 
   } catch (error) {
     console.error('Error executing mute command:', error);
-    return interaction.reply({ content: 'هنگام اجرای فرمان Mute خطایی رخ داد.', ephemeral: true });
+    return interaction.reply({ embeds: [createResponseEmbed(interaction, 'An error occurred while executing the Mute command.', '#FF0000')], ephemeral: true });
   }
 }
 
 async function handleUnmute(interaction, member, user, reason) {
+  const meUnmute = interaction.guild.members.me;
+  if (!meUnmute || !meUnmute.permissions.has(PermissionsBitField.Flags.ManageRoles)) {
+    return interaction.reply({ embeds: [createResponseEmbed(interaction, 'I do not have the Manage Roles permission.', '#FF0000')], ephemeral: true });
+  }
   if (user.bot) {
-    return interaction.reply({ content: 'ربات رو نمیتونی Unmute کنی.', ephemeral: true });
+    return interaction.reply({ embeds: [createResponseEmbed(interaction, 'You cannot unmute a bot.', '#FF0000')], ephemeral: true });
   }
   if (user.id === client.user.id) {
-    return interaction.reply({ content: 'من رو نمیتونی Unmute کنی.', ephemeral: true });
+    return interaction.reply({ embeds: [createResponseEmbed(interaction, 'You cannot unmute me.', '#FF0000')], ephemeral: true });
   }
   if (user.id === interaction.user.id) {
-    return interaction.reply({ content: 'خودتو نمیتونی Unmute کنی.', ephemeral: true });
+    return interaction.reply({ embeds: [createResponseEmbed(interaction, 'You cannot unmute yourself.', '#FF0000')], ephemeral: true });
   }
   const muteRole = interaction.guild.roles.cache.find(role => role.name === MUTE_ROLE_NAME); // Corrected variable name to muteRole
   if (!muteRole) {
-    return interaction.reply({ content: `نقش Mute با نام "${MUTE_ROLE_NAME}" پیدا نشد.`, ephemeral: true });
+    return interaction.reply({ embeds: [createResponseEmbed(interaction, `Mute role named "${MUTE_ROLE_NAME}" was not found.`, '#FF0000')], ephemeral: true });
   }
   if (!member.roles.cache.has(muteRole.id)) { // Corrected variable name to muteRole
-    return interaction.reply({ content: 'کاربر Mute نیست.', ephemeral: true });
+    return interaction.reply({ embeds: [createResponseEmbed(interaction, 'The user is not muted.', '#FFA500')], ephemeral: true });
   }
 
   try {
     await member.roles.remove(muteRole);
     mutedUsers.delete(user.id); // Remove user from mutedUsers
+    recordPunishment(user.id, interaction.user.id, 'Unmute', reason);
 
-    const responseEmbed = createResponseEmbed(interaction, 'کاربر با موفقیت Unmute شد.', '#00FF00', [
-      { name: 'کاربر', value: `${user.tag} (${user.id})` },
+    const responseEmbed = createResponseEmbed(interaction, 'User has been unmuted successfully.', '#00FF00', [
+      { name: 'User', value: `${user.tag} (${user.id})` },
     ], reason); // Pass reason here
 
-    const logEmbed = createLogEmbed(interaction, 'رفع Unmute کاربر', '#008000', [
-      { name: 'کاربر', value: `${user.tag} (${user.id})` },
-      { name: 'دلیل', value: reason || 'بدون دلیل' },
+    const logEmbed = createLogEmbed(interaction, 'User Unmuted', '#008000', [
+      { name: 'User', value: `${user.tag} (${user.id})` },
+      { name: 'Reason', value: reason || 'No reason provided' },
     ], null, null, reason);
 
     const dmEmbed = new EmbedBuilder()
       .setColor('#008000')
-      .setTitle('رفع Unmute')
-      .setDescription('Unmute شما در سرور برداشته شد.')
+      .setTitle('Unmute')
+      .setDescription('You have been unmuted on the server.')
       .addFields([
-        { name: 'دلیل', value: reason || 'بدون دلیل' },
+        { name: 'Reason', value: reason || 'No reason provided' },
       ])
       .setTimestamp();
 
@@ -474,42 +596,54 @@ async function handleUnmute(interaction, member, user, reason) {
 
   } catch (error) {
     console.error('Error executing unmute command:', error);
-    return interaction.reply({ content: 'هنگام اجرای فرمان رفع Unmute خطایی رخ داد.', ephemeral: true });
+    return interaction.reply({ embeds: [createResponseEmbed(interaction, 'An error occurred while executing the Unmute command.', '#FF0000')], ephemeral: true });
   }
 }
 
 async function handleBan(interaction, user, duration, reason) {
+  const meBan = interaction.guild.members.me;
+  if (!meBan || !meBan.permissions.has(PermissionsBitField.Flags.BanMembers)) {
+    return interaction.reply({ embeds: [createResponseEmbed(interaction, 'I do not have the Ban Members permission.', '#FF0000')], ephemeral: true });
+  }
   if (checkPunishmentRateLimit(interaction.user.id, 'Ban')) {
-    return interaction.reply({ content: 'شما در یک ساعت گذشته 3 بار تنبیه انجام داده‌اید. لطفا یک ساعت دیگر صبر کنید.', ephemeral: true });
+    return interaction.reply({ embeds: [createResponseEmbed(interaction, 'You have reached the limit of 3 punishments in the past hour. Please wait one hour.', '#FFA500')], ephemeral: true });
   }
   if (user.bot) {
-    return interaction.reply({ content: 'ربات ها رو نمیتونی Ban کنی.', ephemeral: true });
+    return interaction.reply({ embeds: [createResponseEmbed(interaction, 'You cannot ban bots.', '#FF0000')], ephemeral: true });
   }
   if (user.id === client.user.id) {
-    return interaction.reply({ content: 'من رو نمیتونی Ban کنی.', ephemeral: true });
+    return interaction.reply({ embeds: [createResponseEmbed(interaction, 'You cannot ban me.', '#FF0000')], ephemeral: true });
   }
   if (user.id === interaction.user.id) {
-    return interaction.reply({ content: 'خودتو نمیتونی Ban کنی.', ephemeral: true });
+    return interaction.reply({ embeds: [createResponseEmbed(interaction, 'You cannot ban yourself.', '#FF0000')], ephemeral: true });
+  }
+  const targetMemberForBan = interaction.guild.members.cache.get(user.id);
+  if (targetMemberForBan && !targetMemberForBan.bannable) {
+    return interaction.reply({ embeds: [createResponseEmbed(interaction, 'Cannot ban this user (role hierarchy).', '#FF0000')], ephemeral: true });
   }
   let banOptions = { reason: reason };
   if (duration !== null && duration !== undefined) {
     const durationSeconds = duration * 24 * 60 * 60;
     if (durationSeconds > 604800) {
-      return interaction.reply({ content: 'مدت زمان Ban نمی‌تواند بیشتر از 7 روز باشد.', ephemeral: true });
+      return interaction.reply({ embeds: [createResponseEmbed(interaction, 'The message deletion period cannot exceed 7 days.', '#FF0000')], ephemeral: true });
     }
     banOptions.deleteMessageSeconds = durationSeconds;
   }
 
   const dmEmbed = new EmbedBuilder()
     .setColor('#FF0000')
-    .setTitle('Ban در سرور')
-    .setDescription(`شما از سرور Ban شدید${duration ? ` به مدت ${duration} روز.` : ' به صورت دائم.'}`)
+    .setTitle('Server Ban')
+    .setDescription('You have been banned from the server.')
     .addFields([
-      { name: 'دلیل', value: reason || 'بدون دلیل' },
+      { name: 'Reason', value: reason || 'No reason provided' },
     ])
     .setTimestamp();
 
-  const dmResult = await sendDmEmbed(user, dmEmbed); // Send DM first
+  // Defer reply early to avoid timeouts, then send DM
+  if (!interaction.deferred && !interaction.replied) {
+    await interaction.deferReply();
+  }
+  const dmResult = await sendDmEmbed(user, dmEmbed);
 
   try {
     await interaction.guild.members.ban(user, banOptions);
@@ -517,190 +651,275 @@ async function handleBan(interaction, user, duration, reason) {
     timeoutUsers.delete(user.id);
     recordPunishment(user.id, interaction.user.id, 'Ban', reason, duration); // Record punishment
 
-    const responseEmbed = createResponseEmbed(interaction, 'کاربر با موفقیت Ban شد.', '#00FF00', [
-      { name: 'کاربر', value: `${user.tag} (${user.id})` },
-      { name: 'مدت زمان', value: duration ? `${duration} روز` : 'Permanent' },
-    ], reason);
+    const mention = `<@${user.id}>`;
+    const timeText = new Date().toLocaleTimeString('en-US', { hour: 'numeric', minute: '2-digit' });
+    const desc = `User ${mention} ${user.username} has been banned successfully.\nMessage Deletion: ${duration ?? 0} days\nReason : ${reason || 'No reason provided'}\nToday at ${timeText}`;
+    const responseEmbed = createResponseEmbed(null, desc, '#00FF00');
 
-    const logEmbed = createLogEmbed(interaction, 'Ban کاربر', '#FF0000', [
-      { name: 'کاربر', value: `${user.tag} (${user.id})` },
-      { name: 'مدت زمان', value: duration ? `${duration} روز` : 'Permanent' },
-      { name: 'دلیل', value: reason || 'بدون دلیل' },
+    const logEmbed = createLogEmbed(interaction, 'User Ban', '#FF0000', [
+      { name: 'User', value: `<@${user.id}> ${user.username}` },
+      { name: 'Message Deletion (days)', value: `${duration ?? 0} days` },
+      { name: 'Reason', value: reason || 'No reason provided' },
     ]);
 
 
     await interaction.reply({ embeds: [responseEmbed] });
     await sendLogMessage(logChannelId, logEmbed);
     if (!dmResult) {
-      interaction.channel.send(`ارسال پیام دایرکت به ${user.tag} به دلیل تنظیمات حریم خصوصی کاربر ناموفق بود.`);
+      const dmBlockedLog = createLogEmbed(interaction, 'DM Delivery Failed', '#FFA500', [
+        { name: 'User', value: `<@${user.id}> ${user.username}` },
+        { name: 'Context', value: 'Ban notification' },
+        { name: 'Detail', value: 'Failed to send a DM due to user privacy settings.' },
+      ]);
+      await sendLogMessage(logChannelId, dmBlockedLog);
     }
 
 
   } catch (error) {
     console.error('Error executing ban command:', error);
-    return interaction.reply({ content: 'هنگام اجرای فرمان Ban خطایی رخ داد.', ephemeral: true });
+    if (interaction.deferred || interaction.replied) {
+      return interaction.editReply({ embeds: [createResponseEmbed(interaction, 'An error occurred while executing the Ban command.', '#FF0000')] });
+    }
+    return interaction.reply({ embeds: [createResponseEmbed(interaction, 'An error occurred while executing the Ban command.', '#FF0000')], ephemeral: true });
   }
 }
 
 async function handleUnban(interaction, user, reason) {
-  if (user.bot) {
-    return interaction.reply({ content: 'ربات رو نمیتونی Unban کنی.', ephemeral: true });
+  const meUnban = interaction.guild.members.me;
+  if (!meUnban || !meUnban.permissions.has(PermissionsBitField.Flags.BanMembers)) {
+    return interaction.reply({ embeds: [createResponseEmbed(interaction, 'I do not have the Ban Members permission.', '#FF0000')], ephemeral: true });
   }
-  if (user.id === client.user.id) {
-    return interaction.reply({ content: 'من رو نمیتونی Unban کنی.', ephemeral: true });
+
+  const userIdOpt = interaction.options.getString('userid');
+  const targetId = user ? user.id : (userIdOpt ? userIdOpt.trim() : null);
+  if (!targetId) {
+    return interaction.reply({ embeds: [createResponseEmbed(interaction, 'Please specify a user or a user ID to unban.', '#FF0000')], ephemeral: true });
   }
-  if (user.id === interaction.user.id) {
-    return interaction.reply({ content: 'خودتو نمیتونی Unban کنی.', ephemeral: true });
+
+  let targetUser = user || null;
+  if (!targetUser) {
+    try {
+      targetUser = await client.users.fetch(targetId);
+    } catch {}
   }
+
+  if (targetId === client.user.id) {
+    return interaction.reply({ embeds: [createResponseEmbed(interaction, 'You cannot unban me.', '#FF0000')], ephemeral: true });
+  }
+  if (targetId === interaction.user.id) {
+    return interaction.reply({ embeds: [createResponseEmbed(interaction, 'You cannot unban yourself.', '#FF0000')], ephemeral: true });
+  }
+
   try {
-    await interaction.guild.bans.fetch(user.id);
+    await interaction.guild.bans.fetch(targetId);
   } catch (error) {
-    return interaction.reply({ content: 'کاربر Ban نیست.', ephemeral: true });
+    return interaction.reply({ embeds: [createResponseEmbed(interaction, 'The user is not banned.', '#FFA500')], ephemeral: true });
   }
 
   try {
-    await interaction.guild.members.unban(user, reason);
-    mutedUsers.delete(user.id);
-    timeoutUsers.delete(user.id);
+    await interaction.guild.members.unban(targetId, reason);
+    mutedUsers.delete(targetId);
+    timeoutUsers.delete(targetId);
+    recordPunishment(targetId, interaction.user.id, 'Unban', reason);
 
-    const responseEmbed = createResponseEmbed(interaction, 'کاربر با موفقیت Unban شد.', '#00FF00', [
-      { name: 'کاربر', value: `${user.tag} (${user.id})` },
+    const displayTag = targetUser ? `${targetUser.tag}` : 'Unknown User';
+    const responseEmbed = createResponseEmbed(interaction, 'User has been unbanned successfully.', '#00FF00', [
+      { name: 'User', value: `${displayTag} (${targetId})` },
     ], reason);
 
-    const logEmbed = createLogEmbed(interaction, 'رفع Ban کاربر', '#008000', [
-      { name: 'کاربر', value: `${user.tag} (${user.id})` },
-      { name: 'دلیل', value: reason || 'بدون دلیل' },
+    const logEmbed = createLogEmbed(interaction, 'User Unbanned', '#008000', [
+      { name: 'User', value: `${displayTag} (${targetId})` },
+      { name: 'Reason', value: reason || 'No reason provided' },
     ], null, null, reason);
 
     const dmEmbed = new EmbedBuilder()
       .setColor('#008000')
-      .setTitle('رفع Ban')
-      .setDescription('Ban شما از سرور برداشته شد.')
+      .setTitle('Ban Lifted')
+      .setDescription('Your ban has been lifted from the server.')
       .addFields([
-        { name: 'دلیل', value: reason || 'بدون دلیل' },
+        { name: 'Reason', value: reason || 'No reason provided' },
       ])
       .setTimestamp();
 
     await interaction.reply({ embeds: [responseEmbed] });
     await sendLogMessage(logChannelId, logEmbed);
-    sendDmEmbed(user, dmEmbed);
+    if (targetUser) sendDmEmbed(targetUser, dmEmbed);
 
   } catch (error) {
     console.error('Error executing unban command:', error);
-    return interaction.reply({ content: 'هنگام اجرای فرمان رفع Ban خطایی رخ داد.', ephemeral: true });
+    return interaction.reply({ embeds: [createResponseEmbed(interaction, 'An error occurred while executing the Unban command.', '#FF0000')], ephemeral: true });
   }
 }
 
 async function handleKick(interaction, member, user, reason) {
+  const meKick = interaction.guild.members.me;
+  if (!meKick || !meKick.permissions.has(PermissionsBitField.Flags.KickMembers)) {
+    return interaction.reply({ embeds: [createResponseEmbed(interaction, 'I do not have the Kick Members permission.', '#FF0000')], ephemeral: true });
+  }
   if (checkPunishmentRateLimit(interaction.user.id, 'Kick')) {
-    return interaction.reply({ content: 'شما در یک ساعت گذشته 3 بار تنبیه انجام داده‌اید. لطفا یک ساعت دیگر صبر کنید.', ephemeral: true });
+    return interaction.reply({ embeds: [createResponseEmbed(interaction, 'You have reached the limit of 3 punishments in the past hour. Please wait one hour.', '#FFA500')], ephemeral: true });
   }
   if (user.bot) {
-    return interaction.reply({ content: 'ربات ها رو نمیتونی Kick کنی.', ephemeral: true });
+    return interaction.reply({ embeds: [createResponseEmbed(interaction, 'You cannot kick bots.', '#FF0000')], ephemeral: true });
   }
   if (user.id === client.user.id) {
-    return interaction.reply({ content: 'من رو نمیتونی Kick کنی.', ephemeral: true });
+    return interaction.reply({ embeds: [createResponseEmbed(interaction, 'You cannot kick me.', '#FF0000')], ephemeral: true });
   }
   if (user.id === interaction.user.id) {
-    return interaction.reply({ content: 'خودتو نمیتونی Kick کنی.', ephemeral: true });
+    return interaction.reply({ embeds: [createResponseEmbed(interaction, 'You cannot kick yourself.', '#FF0000')], ephemeral: true });
   }
   if (!member) {
-    return interaction.reply({ content: 'کاربر مورد نظر در سرور یافت نشد.', ephemeral: true });
+    return interaction.reply({ embeds: [createResponseEmbed(interaction, 'The specified user was not found in the server.', '#FF0000')], ephemeral: true });
   }
 
   const dmEmbed = new EmbedBuilder()
     .setColor('#DAA520')
-    .setTitle('Kick از سرور')
-    .setDescription('شما از سرور Kick شدید.')
+    .setTitle('Server Kick')
+    .setDescription('You have been kicked from the server.')
     .addFields([
-      { name: 'دلیل', value: reason || 'بدون دلیل' },
+      { name: 'Reason', value: reason || 'No reason provided' },
     ])
     .setTimestamp();
 
-  const dmResult = await sendDmEmbed(user, dmEmbed); // Send DM first - Corrected line: using dmEmbed instead of embed
+  // Defer reply before potentially slow operations
+  if (!interaction.deferred && !interaction.replied) {
+    await interaction.deferReply();
+  }
+  const dmResult = await sendDmEmbed(user, dmEmbed); // Send DM first
 
   try {
-    if (dmResult !== false) {
-      await member.kick(reason);
-      mutedUsers.delete(user.id);
-      timeoutUsers.delete(user.id);
-      recordPunishment(user.id, interaction.user.id, 'Kick', reason); // Record punishment
-
-      const responseEmbed = createResponseEmbed(interaction, 'کاربر با موفقیت Kick شد.', '#00FF00', [
-        { name: 'کاربر', value: `${user.tag} (${user.id})` },
-      ], reason);
-
-      const logEmbed = createLogEmbed(interaction, 'Kick کاربر', '#FF0000', [
-        { name: 'کاربر', value: `${user.tag} (${user.id})` },
-        { name: 'دلیل', value: String(reason) || 'بدون دلیل' },
-      ]);
-
-
-      await interaction.reply({ embeds: [responseEmbed] });
-      await sendLogMessage(logChannelId, logEmbed);
-    } else {
-      return interaction.reply({ content: `کاربر ${user.tag} با موفقیت Kick شد اما ارسال پیام دایرکت به دلیل تنظیمات حریم خصوصی کاربر ناموفق بود.`, ephemeral: true });
+    if (!member.kickable) {
+      if (interaction.deferred || interaction.replied) {
+        return interaction.editReply({ embeds: [createResponseEmbed(interaction, 'Cannot kick this user (role hierarchy).', '#FF0000')] });
+      }
+      return interaction.reply({ embeds: [createResponseEmbed(interaction, 'Cannot kick this user (role hierarchy).', '#FF0000')], ephemeral: true });
     }
+    await member.kick(reason);
+    mutedUsers.delete(user.id);
+    timeoutUsers.delete(user.id);
+    recordPunishment(user.id, interaction.user.id, 'Kick', reason); // Record punishment
 
+    const mention = `<@${user.id}>`;
+    const timeText = new Date().toLocaleTimeString('en-US', { hour: 'numeric', minute: '2-digit' });
+    const desc = `User ${mention} ${user.username} has been kicked successfully.\nReason: ${reason || 'No reason provided'}`;
+    const botRoleColor = interaction.guild.members.me?.roles.highest.color || '#00FF00';
+    const responseEmbed = createResponseEmbed(null, desc, botRoleColor);
+
+    const logEmbed = createLogEmbed(interaction, 'User Kick', '#FF0000', [
+      { name: 'User', value: `<@${user.id}> ${user.username}` },
+      { name: 'Reason', value: String(reason) || 'No reason provided' },
+    ]);
+
+    await interaction.editReply({ embeds: [responseEmbed] });
+    await sendLogMessage(logChannelId, logEmbed);
+    if (dmResult !== true) {
+      const dmBlockedLog = createLogEmbed(interaction, 'DM Delivery Failed', '#FFA500', [
+        { name: 'User', value: `<@${user.id}> ${user.username}` },
+        { name: 'Context', value: 'Kick notification' },
+        { name: 'Detail', value: 'Failed to send a DM due to user privacy settings or other error.' },
+      ]);
+      await sendLogMessage(logChannelId, dmBlockedLog);
+    }
+  
 
   } catch (error) {
     console.error('Error executing kick command:', error);
-    return interaction.reply({ content: 'هنگام اجرای فرمان Kick خطایی رخ داد.', ephemeral: true });
+    if (interaction.deferred || interaction.replied) {
+      return interaction.editReply({ embeds: [createResponseEmbed(interaction, 'An error occurred while executing the Kick command.', '#FF0000')] });
+    }
+    return interaction.reply({ embeds: [createResponseEmbed(interaction, 'An error occurred while executing the Kick command.', '#FF0000')], ephemeral: true });
   }
 }
 
 async function handleClear(interaction, number) {
   try {
     if (!interaction.member) {
-      return interaction.reply({ content: 'خطا در دریافت اطلاعات کاربر. این دستور فقط در سرور قابل استفاده است.', ephemeral: true });
-    }
-
-    if (!interaction.memberPermissions.has('MANAGE_MESSAGES')) {
-      return interaction.reply({ content: 'شما مجوز مدیریت پیام ها را ندارید.', ephemeral: true });
+      return interaction.reply({ embeds: [createResponseEmbed(interaction, 'Failed to retrieve member info. This command can only be used in a guild.', '#FF0000')], ephemeral: true });
     }
 
     if (number > 100 || number <= 0) {
-      return interaction.reply({ content: 'تعداد پیام ها برای پاک کردن باید بین 1 تا 100 باشد.', ephemeral: true });
+      return interaction.reply({ embeds: [createResponseEmbed(interaction, 'The number of messages to delete must be between 1 and 100.', '#FF0000')], ephemeral: true });
     }
 
     await interaction.deferReply({ ephemeral: true });
 
-    const messages = await interaction.channel.messages.fetch({ limit: number });
-    const deletedCount = messages.size;
-    await interaction.channel.bulkDelete(messages, true);
+    const deleted = await interaction.channel.bulkDelete(number, true);
+    const deletedCount = deleted.size;
 
 
-    const responseEmbed = createResponseEmbed(interaction, `با موفقیت ${deletedCount} پیام پاک شد.`, '#00FF00');
+    const responseEmbed = createResponseEmbed(interaction, `Successfully deleted ${deletedCount} messages.`, '#00FF00');
 
     const logEmbed = createLogEmbed(interaction, 'Clear Messages', '#FFA500', [
       { name: 'Type', value: 'Message Clear', inline: true },
-      { name: 'Channel', value: `${interaction.channel.name} (${interaction.channel.id})`, inline: true },
+      { name: 'Channel', value: `<#${interaction.channel.id}>`, inline: true },
       { name: 'Number of Messages', value: String(deletedCount), inline: true },
     ])
     .setTimestamp()
     .setFooter({ text: 'Channel Log' });
 
     await sendLogMessage(logChannelId, logEmbed);
+
+    // For each deleted message, create a text file and upload to log channel
+    try {
+      const sortedDeleted = Array.from(deleted.values()).sort((a, b) => a.createdTimestamp - b.createdTimestamp);
+      for (const msg of sortedDeleted) {
+        const lines = [];
+        lines.push('Deleted Message');
+        lines.push(`Message ID: ${msg.id}`);
+        lines.push(`Channel: ${interaction.channel.name} (${interaction.channel.id})`);
+        const authorLine = msg.author ? `${msg.author.tag} (${msg.author.id})` : 'Unknown';
+        lines.push(`Author: ${authorLine}`);
+        const created = msg.createdAt ? msg.createdAt.toLocaleString() : 'Unknown';
+        lines.push(`Created: ${created}`);
+        lines.push('');
+        lines.push('Content:');
+        const content = (typeof msg.content === 'string' && msg.content.length) ? msg.content : '[no content]';
+        lines.push(content);
+        if (msg.attachments && msg.attachments.size > 0) {
+          lines.push('');
+          lines.push('Attachments:');
+          msg.attachments.forEach(att => {
+            try {
+              lines.push(`${att.name} - ${att.url}`);
+            } catch {}
+          });
+        }
+        const fileBuffer = Buffer.from(lines.join('\n'), 'utf8');
+        const fileName = `deleted_${interaction.channel.id}_${msg.id}.txt`;
+        await sendLogMessage(logChannelId, null, [{ attachment: fileBuffer, name: fileName }]);
+      }
+    } catch (e) {
+      console.error('Error generating deleted message text files:', e);
+    }
+
     interaction.editReply({ embeds: [responseEmbed] });
   } catch (error) {
     console.error('Error executing clear command:', error);
-    return interaction.editReply({ content: 'هنگام اجرای فرمان پاکسازی پیام ها خطایی رخ داد.' });
+    return interaction.editReply({ embeds: [createResponseEmbed(interaction, 'An error occurred while executing the clear command.', '#FF0000')] });
   }
 }
 
 async function handleStatus(interaction) {
   const uptime = formatUptime(process.uptime());
-  const embed = createResponseEmbed(interaction, 'Bot Status', '#00FF00', [
+  const totalMembers = interaction.guild.memberCount;
+  const muteRole = interaction.guild.roles.cache.find(role => role.name === MUTE_ROLE_NAME);
+  const mutedCount = muteRole ? muteRole.members.size : 0;
+  const onlineCount = interaction.guild.members.cache.filter(m => m.presence && ['online', 'idle', 'dnd'].includes(m.presence.status)).size;
+
+  const meMember = interaction.guild.members.me;
+  const embedColor = (meMember && meMember.displayHexColor && meMember.displayHexColor !== '#000000') ? meMember.displayHexColor : '#00FF00';
+
+  const embed = createResponseEmbed(null, 'Bot Status', embedColor, [
     { name: 'Uptime', value: uptime },
-    { name: 'Ping', value: `${client.ws.ping}ms` }
+    { name: 'Ping', value: `${client.ws.ping}ms` },
+    { name: 'Total Members', value: String(totalMembers) },
+    { name: 'Online', value: String(onlineCount) },
+    { name: 'Muted', value: String(mutedCount) },
   ]);
   await interaction.reply({ embeds: [embed] });
 }
 
 async function handleReloadCommands(interaction) {
-  if (!interaction.memberPermissions.has('ADMINISTRATOR')) {
-    return interaction.reply({ content: 'You must be an administrator to use this command.', ephemeral: true });
-  }
 
   try {
     await registerCommands();
@@ -719,22 +938,38 @@ async function handleDmCommand(interaction) {
 
   const dmEmbed = new EmbedBuilder()
     .setColor('#00FF00')
-    .setDescription(messageContent);
+    .setDescription(messageContent)
+    .setFooter({ text: `Sent at: ${new Date().toLocaleString()}` })
+    .setTimestamp();
 
   const dmResult = await sendDmEmbed(user, dmEmbed);
 
   if (dmResult === true) {
+    const truncated = typeof messageContent === 'string' && messageContent.length > 1024
+      ? messageContent.slice(0, 1021) + '...'
+      : messageContent;
     const logEmbed = createLogEmbed(interaction, 'DM Command Used', '#009fd3', [
       { name: 'Target User', value: `${user.tag} (${user.id})` },
-      { name: 'Message Content', value: messageContent },
+      { name: 'Message Content', value: truncated },
     ]);
     await sendLogMessage(logChannelId, logEmbed);
-    await interaction.reply({ content: `پیام با موفقیت به ${user.tag} ارسال شد.`, ephemeral: true });
+    await interaction.reply({ embeds: [createResponseEmbed(interaction, `Message successfully sent to ${user.tag}.`, '#00FF00')], ephemeral: true });
   } else if (dmResult === null) {
-    await interaction.reply({ content: `ارسال پیام به ${user.tag} به دلیل تنظیمات حریم خصوصی کاربر ناموفق بود.`, ephemeral: true });
-  }
-   else {
-    await interaction.reply({ content: `هنگام ارسال پیام به ${user.tag} خطایی رخ داد.`, ephemeral: true });
+    const dmBlockedLog = createLogEmbed(interaction, 'DM Delivery Failed', '#FFA500', [
+      { name: 'User', value: `<@${user.id}> ${user.username}` },
+      { name: 'Context', value: 'DM command' },
+      { name: 'Detail', value: 'Failed to send a DM due to user privacy settings.' },
+    ]);
+    await sendLogMessage(logChannelId, dmBlockedLog);
+    await interaction.reply({ embeds: [createResponseEmbed(null, 'DM delivery failed (logged).', '#FFA500')], ephemeral: true });
+  } else {
+    const dmErrorLog = createLogEmbed(interaction, 'DM Delivery Error', '#FF0000', [
+      { name: 'User', value: `<@${user.id}> ${user.username}` },
+      { name: 'Context', value: 'DM command' },
+      { name: 'Detail', value: 'An error occurred while sending DM.' },
+    ]);
+    await sendLogMessage(logChannelId, dmErrorLog);
+    await interaction.reply({ embeds: [createResponseEmbed(null, 'An error occurred while sending DM (logged).', '#FF0000')], ephemeral: true });
   }
 }
 
@@ -743,7 +978,7 @@ async function handlePunishmentList(interaction, user) {
   const history = punishmentHistory.get(userId) || [];
 
   if (history.length === 0) {
-    return interaction.reply({ content: `هیچ سابقه تنبیهی برای ${user.tag} وجود ندارد.`, ephemeral: true });
+    return interaction.reply({ embeds: [createResponseEmbed(interaction, `There is no punishment history for ${user.tag}.`, '#FFA500')], ephemeral: true });
   }
 
   const embed = new EmbedBuilder()
@@ -756,7 +991,7 @@ async function handlePunishmentList(interaction, user) {
     const moderatorTag = moderator ? moderator.user.tag : 'Unknown Moderator';
     const timestamp = record.timestamp.toLocaleDateString() + ' ' + record.timestamp.toLocaleTimeString();
     let durationText = record.duration ? `${record.duration} minutes` : 'Permanent';
-    if (record.type === 'Ban' && record.duration) durationText = `${record.duration} days`;
+    if ((record.type === 'Ban' || record.type === 'Mute') && record.duration) durationText = `${record.duration} days`;
     if (record.type === 'Kick' || record.type === 'Unban' || record.type === 'Untimeout' || record.type === 'Unmute') durationText = 'N/A';
 
 
@@ -789,9 +1024,6 @@ async function handleHelp(interaction) {
 
 // --- Channel Lock/Unlock Command Handlers ---
 async function handleLockChannel(interaction) {
-  if (!interaction.memberPermissions.has('MANAGE_CHANNELS')) {
-    return interaction.reply({ content: 'You require the "Manage Channels" permission to use this command.', ephemeral: true });
-  }
 
   const channel = interaction.channel;
   const roleId = '1282825490054385706';
@@ -799,12 +1031,12 @@ async function handleLockChannel(interaction) {
   const reason = interaction.options.getString('reason') || 'No reason provided'; // Get reason from options
 
   if (!role) {
-    return interaction.reply({ content: `Role with ID ${roleId} not found.`, ephemeral: true });
+    return interaction.reply({ embeds: [createResponseEmbed(interaction, `Role with ID ${roleId} not found.`, '#FF0000')], ephemeral: true });
   }
 
   const currentPermissions = channel.permissionOverwrites.cache.get(role.id);
-  if (currentPermissions && currentPermissions.deny.has('SendMessages')) {
-    return interaction.reply({ content: 'Channel is already locked for this role.', ephemeral: true });
+  if (currentPermissions && currentPermissions.deny.has(PermissionsBitField.Flags.SendMessages)) {
+    return interaction.reply({ embeds: [createResponseEmbed(interaction, 'Channel is already locked for this role.', '#FFA500')], ephemeral: true });
   }
 
   try {
@@ -814,7 +1046,7 @@ async function handleLockChannel(interaction) {
 
     const responseEmbed = createResponseEmbed(interaction, `Channel locked for role <@&${roleId}>.`, '#00FF00', [{ name: 'Reason', value: reason }]); // Added reason to response
     const logEmbed = createLogEmbed(interaction, 'Channel Locked', '#FF0000', [
-      { name: 'Channel', value: `${channel.name} (${channel.id})` },
+      { name: 'Channel', value: `<#${channel.id}>` },
       { name: 'Role', value: `<@&${roleId}> (${roleId})` },
       { name: 'Reason', value: reason }, // Added reason to log
     ]);
@@ -824,14 +1056,11 @@ async function handleLockChannel(interaction) {
 
   } catch (error) {
     console.error('Error locking channel:', error);
-    return interaction.reply({ content: 'Failed to lock the channel.', ephemeral: true });
+    return interaction.reply({ embeds: [createResponseEmbed(interaction, 'Failed to lock the channel.', '#FF0000')], ephemeral: true });
   }
 }
 
 async function handleUnlockChannel(interaction) {
-  if (!interaction.memberPermissions.has('MANAGE_CHANNELS')) {
-    return interaction.reply({ content: 'You require the "Manage Channels" permission to use this command.', ephemeral: true });
-  }
 
   const channel = interaction.channel;
   const roleId = '1282825490054385706';
@@ -839,12 +1068,12 @@ async function handleUnlockChannel(interaction) {
   const reason = interaction.options.getString('reason') || 'No reason provided'; // Get reason from options
 
   if (!role) {
-    return interaction.reply({ content: `Role with ID ${roleId} not found.`, ephemeral: true });
+    return interaction.reply({ embeds: [createResponseEmbed(interaction, `Role with ID ${roleId} not found.`, '#FF0000')], ephemeral: true });
   }
 
   const currentPermissions = channel.permissionOverwrites.cache.get(role.id);
-  if (currentPermissions && !currentPermissions.deny.has('SendMessages')) {
-    return interaction.reply({ content: 'Channel is already unlocked for this role.', ephemeral: true });
+  if (currentPermissions && !currentPermissions.deny.has(PermissionsBitField.Flags.SendMessages)) {
+    return interaction.reply({ embeds: [createResponseEmbed(interaction, 'Channel is already unlocked for this role.', '#FFA500')], ephemeral: true });
   }
 
 
@@ -855,7 +1084,7 @@ async function handleUnlockChannel(interaction) {
 
     const responseEmbed = createResponseEmbed(interaction, `Channel unlocked for role <@&${roleId}>.`, '#00FF00', [{ name: 'Reason', value: reason }]); // Added reason to response
     const logEmbed = createLogEmbed(interaction, 'Channel Unlocked', '#008000', [
-      { name: 'Channel', value: `${channel.name} (${channel.id})` },
+      { name: 'Channel', value: `<#${channel.id}>` },
       { name: 'Role', value: `<@&${roleId}> (${roleId})` },
       { name: 'Reason', value: reason }, // Added reason to log
     ]);
@@ -865,16 +1094,13 @@ async function handleUnlockChannel(interaction) {
 
   } catch (error) {
     console.error('Error unlocking channel:', error);
-    return interaction.reply({ content: 'Failed to unlock the channel.', ephemeral: true });
+    return interaction.reply({ embeds: [createResponseEmbed(interaction, 'Failed to unlock the channel.', '#FF0000')], ephemeral: true });
   }
 }
 
 async function handleSlowmode(interaction) {
-  if (!interaction.memberPermissions.has('MANAGE_CHANNELS')) {
-    return interaction.reply({ content: 'You require the "Manage Channels" permission to use this command.', ephemeral: true });
-  }
   if (checkPunishmentRateLimit(interaction.user.id, 'Slowmode')) {
-    return interaction.reply({ content: 'شما در یک ساعت گذشته 3 بار تنبیه انجام داده‌اید. لطفا یک ساعت دیگر صبر کنید.', ephemeral: true });
+    return interaction.reply({ embeds: [createResponseEmbed(interaction, 'You have reached the limit of 3 punishments in the past hour. Please wait one hour.', '#FFA500')], ephemeral: true });
   }
 
   const channel = interaction.channel;
@@ -882,25 +1108,26 @@ async function handleSlowmode(interaction) {
   const reason = interaction.options.getString('reason') || 'No reason provided';
 
   if (duration < 0 || duration > 21600) { // Discord slowmode limit is 6 hours (21600 seconds)
-    return interaction.reply({ content: 'مدت زمان Slowmode باید بین 0 تا 21600 ثانیه باشد.', ephemeral: true });
+    return interaction.reply({ embeds: [createResponseEmbed(interaction, 'Slowmode duration must be between 0 and 21600 seconds.', '#FF0000')], ephemeral: true });
   }
 
   try {
     await channel.setRateLimitPerUser(duration, reason);
 
-    const responseEmbed = createResponseEmbed(interaction, `Slowmode با موفقیت ${duration > 0 ? `${duration} ثانیه` : 'غیرفعال'} شد.`, '#00FF00', [{ name: 'Reason', value: reason }]);
+    const responseEmbed = createResponseEmbed(interaction, `Slowmode ${duration > 0 ? `${duration} seconds` : 'disabled'} successfully.`, '#00FF00', [{ name: 'Reason', value: reason }]);
     const logEmbed = createLogEmbed(interaction, 'Slowmode Updated', '#FFA500', [
-      { name: 'Channel', value: `${channel.name} (${channel.id})` },
+      { name: 'Channel', value: `<#${channel.id}>` },
       { name: 'Duration', value: `${duration} seconds` },
       { name: 'Reason', value: reason },
     ]);
 
     await interaction.reply({ embeds: [responseEmbed], ephemeral: true });
     await sendLogMessage(logChannelId, logEmbed);
+    updatePunishmentCount(interaction.user.id, 'Slowmode');
 
   } catch (error) {
     console.error('Error setting slowmode:', error);
-    return interaction.reply({ content: 'Failed to set slowmode.', ephemeral: true });
+    return interaction.reply({ embeds: [createResponseEmbed(interaction, 'Failed to set slowmode.', '#FF0000')], ephemeral: true });
   }
 }
 
@@ -942,7 +1169,7 @@ client.on('interactionCreate', async interaction => {
 
   const handler = commandHandlers[interaction.commandName];
   if (!handler) {
-    return interaction.reply({ content: 'فرمان نامعتبر.', ephemeral: true });
+    return interaction.reply({ embeds: [createResponseEmbed(interaction, 'Invalid command.', '#FF0000')], ephemeral: true });
   }
 
   const user = interaction.options.getUser('user');
@@ -951,6 +1178,11 @@ client.on('interactionCreate', async interaction => {
   const number = interaction.options.getInteger('number');
   const message = interaction.options.getString('message'); // Get message for dm command
 
+  const commandsRequireUser = ['timeout', 'mute', 'ban', 'kick', 'unmute', 'untimeout', 'dm', 'punishmentlist'];
+  if (commandsRequireUser.includes(interaction.commandName) && !user) {
+    return interaction.reply({ embeds: [createResponseEmbed(interaction, 'Please specify a user.', '#FF0000')], ephemeral: true });
+  }
+
 
   if (interaction.commandName === 'ban') {
   }
@@ -958,44 +1190,60 @@ client.on('interactionCreate', async interaction => {
 
   let member = null;
 
-  if (!['clear', 'status', 'reloadcommands', 'dm', 'help', 'punishmentlist', 'lockchannel', 'unlockchannel', 'slowmode'].includes(interaction.commandName)) { // Include help, punishmentlist, lockchannel, unlockchannel, slowmode command
+  if (!['clear', 'status', 'reloadcommands', 'dm', 'help', 'punishmentlist', 'lockchannel', 'unlockchannel', 'slowmode', 'unban'].includes(interaction.commandName)) { // Include help, punishmentlist, lockchannel, unlockchannel, slowmode, unban command
     member = interaction.guild.members.cache.get(user.id);
   }
 
   try {
     if (interaction.commandName === 'clear') {
-      await handler(interaction, number);
+      await commandHandlers.clear(interaction, number);
     } else if (interaction.commandName === 'status') {
-      await handler(interaction);
+      await commandHandlers.status(interaction);
     } else if (interaction.commandName === 'reloadcommands') {
-      await handler(interaction);
-    } else if (interaction.commandName === 'dm') { // Handle dm command
-      await handler(interaction);
-    } else if (interaction.commandName === 'help') { // Handle help command
-      await handler(interaction);
-    } else if (interaction.commandName === 'punishmentlist') { // Handle punishmentlist command
-      await handler(interaction, user);
-    } else if (interaction.commandName === 'lockchannel') { // Handle lockchannel command
-      await handler(interaction);
-    } else if (interaction.commandName === 'unlockchannel') { // Handle unlockchannel command
-      await handler(interaction);
-    } else if (interaction.commandName === 'slowmode') { // Handle slowmode command
-      await handler(interaction);
-    }
-    else if (['timeout', 'untimeout', 'mute', 'unmute', 'kick'].includes(interaction.commandName)) {
-      await handler(interaction, member, user, duration, reason);
-    }
-    else if (['ban', 'unban'].includes(interaction.commandName)) {
-      await handler(interaction, user, duration, reason);
-    }
-     else {
+      await commandHandlers.reloadcommands(interaction);
+    } else if (interaction.commandName === 'dm') {
+      await commandHandlers.dm(interaction);
+    } else if (interaction.commandName === 'help') {
+      await commandHandlers.help(interaction);
+    } else if (interaction.commandName === 'punishmentlist') {
+      await commandHandlers.punishmentlist(interaction, user);
+    } else if (interaction.commandName === 'lockchannel') {
+      await commandHandlers.lockchannel(interaction);
+    } else if (interaction.commandName === 'unlockchannel') {
+      await commandHandlers.unlockchannel(interaction);
+    } else if (interaction.commandName === 'slowmode') {
+      await commandHandlers.slowmode(interaction);
+    } else if (interaction.commandName === 'timeout') {
+      await commandHandlers.timeout(interaction, member, user, duration, reason);
+    } else if (interaction.commandName === 'untimeout') {
+      await commandHandlers.untimeout(interaction, member, user, reason);
+    } else if (interaction.commandName === 'mute') {
+      await commandHandlers.mute(interaction, member, user, duration, reason);
+    } else if (interaction.commandName === 'unmute') {
+      await commandHandlers.unmute(interaction, member, user, reason);
+    } else if (interaction.commandName === 'kick') {
+      await commandHandlers.kick(interaction, member, user, reason);
+    } else if (interaction.commandName === 'ban') {
+      await commandHandlers.ban(interaction, user, duration, reason);
+    } else if (interaction.commandName === 'unban') {
+      await commandHandlers.unban(interaction, user, reason);
+    } else {
       await handler(interaction, member, user, duration, reason, number);
     }
   } catch (error) {
     console.error('Command execution error:', error);
-    interaction.reply({ content: 'هنگام اجرای فرمان خطایی رخ داد.', ephemeral: true });
+    try {
+      if (interaction.deferred || interaction.replied) {
+        await interaction.editReply({ embeds: [createResponseEmbed(interaction, 'An error occurred while executing the command.', '#FF0000')] });
+      } else {
+        await interaction.reply({ embeds: [createResponseEmbed(interaction, 'An error occurred while executing the command.', '#FF0000')], ephemeral: true });
+      }
+    } catch (e) {
+      // swallow
+    }
   }
-});
+}
+);
 
 client.on('voiceStateUpdate', async (oldState, newState) => {
   const userId = newState.member.id;
@@ -1005,14 +1253,17 @@ client.on('voiceStateUpdate', async (oldState, newState) => {
 
   if (newState.channelId === voiceChannelId && oldState.channelId !== voiceChannelId) {
     // User joined the special voice channel
-    voiceJoinTimers.set(userId, setTimeout(async => {
+    voiceJoinTimers.set(userId, setTimeout(async () => {
       if (newState.channelId === voiceChannelId) {
         // User is still in the channel after 30 seconds
         if (notificationChannel) {
           const notificationEmbed = new EmbedBuilder()
             .setColor('#FFA500')
-            .setDescription(`<@${userId}> به کانال ویس رسید و بیشتر از 30 ثانیه است که داخل ویس است.`);
-          notificationChannel.send({ content: `<@&${targetRole.id}>`, embeds: [notificationEmbed] }).then(message => {
+            .setDescription(`${targetRole ? `<@&${targetRole.id}> ` : ''}<@${userId}> joined the voice channel and has been in it for more than 30 seconds.`);
+          notificationChannel.send({
+            embeds: [notificationEmbed],
+            allowedMentions: targetRole ? { roles: [targetRole.id], users: [userId] } : { users: [userId] }
+          }).then(message => {
             notificationMessages.set(userId, message.id); // Store message ID
           });
         }
@@ -1028,7 +1279,8 @@ client.on('voiceStateUpdate', async (oldState, newState) => {
     if (notificationMessages.has(userId)) {
       const messageId = notificationMessages.get(userId);
       try {
-        notificationChannel.messages.delete(messageId); // Delete notification message
+        const msg = await notificationChannel.messages.fetch(messageId).catch(() => null);
+        if (msg) await msg.delete(); // Delete notification message safely
         notificationMessages.delete(userId); // Remove message ID from map
       } catch (error) {
         console.error('Error deleting notification message:', error);
@@ -1037,52 +1289,128 @@ client.on('voiceStateUpdate', async (oldState, newState) => {
   }
 });
 
+client.on('messageCreate', async (message) => {
+  try {
+    if (message.author?.bot) return;
+    if (message.guild) return; // Only DMs
 
-client.on('guildInviteCreate', async invite => {
-  inviteCache.set(invite.code, invite);
+    const author = message.author;
+    const avatarURL = author.displayAvatarURL({ dynamic: true, size: 512 });
+    const content = typeof message.content === 'string' && message.content.length
+      ? message.content.slice(0, 1024)
+      : '[no content]';
+    let attachmentsText = '';
+    try {
+      if (message.attachments && message.attachments.size > 0) {
+        attachmentsText = Array.from(message.attachments.values())
+          .map(att => `${att.name} - ${att.url}`)
+          .join('\n');
+      }
+    } catch {}
+
+    const fields = [
+      { name: 'Type', value: 'Direct Message', inline: true },
+      { name: 'From', value: `<@${author.id}> ${author.tag}`, inline: true },
+      { name: 'User Id', value: `${author.id}`, inline: true },
+      { name: 'Content', value: content },
+    ];
+    if (attachmentsText) {
+      fields.push({ name: 'Attachments', value: attachmentsText.slice(0, 1024) });
+    }
+
+    const dmLogEmbed = new EmbedBuilder()
+      .setColor('#0099ff')
+      .setTitle('Incoming DM')
+      .setThumbnail(avatarURL)
+      .addFields(fields)
+      .setTimestamp()
+      .setFooter({ text: 'Server Log' });
+
+    await sendLogMessage(logChannelId, dmLogEmbed);
+  } catch (e) {
+    console.error('Error logging incoming DM:', e);
+  }
+});
+
+client.on('inviteCreate', async invite => {
+  const map = inviteCache.get(invite.guild.id) || new Map();
+  map.set(invite.code, invite);
+  inviteCache.set(invite.guild.id, map);
   try {
     const fetchedInvite = await invite.fetch();
+
+    const inviter = fetchedInvite.inviter ?? null;
+    const inviterTag = inviter?.tag || 'Unknown';
+    const inviterId = inviter?.id || null;
+    const inviterMention = inviterId ? `<@${inviterId}>` : 'Unknown';
+
+    const channelId = fetchedInvite.channel?.id || invite.channel?.id || null;
+    const uses = typeof fetchedInvite.uses === 'number' ? fetchedInvite.uses : 0;
+    const maxUsesRaw = typeof fetchedInvite.maxUses === 'number' ? fetchedInvite.maxUses : 0;
+    const usesText = `${uses}/${maxUsesRaw === 0 ? '∞' : maxUsesRaw}`;
+    const maxAgeSec = typeof fetchedInvite.maxAge === 'number' ? fetchedInvite.maxAge : 0;
+    const maxAgeText = maxAgeSec === 0 ? '∞ (never)' : `${Math.round(maxAgeSec / 60)}`;
+    const tempText = fetchedInvite.temporary ? 'Yes' : 'No';
+
+    let inviterTotalInvites = null;
+    if (inviterId) {
+      try {
+        const allInvites = await invite.guild.invites.fetch({ cache: false });
+        inviterTotalInvites = Array.from(allInvites.values())
+          .filter(i => i.inviter && i.inviter.id === inviterId)
+          .reduce((sum, i) => sum + (typeof i.uses === 'number' ? i.uses : 0), 0);
+      } catch (e) {
+        inviterTotalInvites = null;
+      }
+    }
 
     const logEmbed = new EmbedBuilder()
       .setColor('#FFA500')
       .setTitle('Channel Activity')
       .addFields(
         { name: 'Type', value: 'Invite Create', inline: true },
-        { name: 'Channel Name', value: `${fetchedInvite.channel.name}`, inline: true },
-        { name: 'Channel Id', value: `${fetchedInvite.channel.id}`, inline: true },
-        { name: 'Inviter Tag', value: `${fetchedInvite.inviter.tag}`, inline: true },
-        { name: 'Inviter Id', value: `${fetchedInvite.inviter.id}`, inline: true },
+        { name: 'Channel', value: channelId ? `<#${channelId}>` : 'Unknown', inline: true },
+        { name: 'Inviter', value: inviterId ? `${inviterMention} ${inviterTag}` : 'Unknown', inline: true },
+        { name: 'Inviter Id', value: inviterId ? `${inviterId}` : 'Unknown', inline: true },
+        { name: 'Inviter Total Invites', value: inviterTotalInvites !== null ? `${inviterTotalInvites}` : 'Unknown', inline: true },
         { name: 'Invite Code', value: fetchedInvite.code, inline: true },
         { name: 'Invite URL', value: `https://discord.gg/${fetchedInvite.code}`, inline: true },
-        { name: 'Uses', value: `${fetchedInvite.uses}/${fetchedInvite.maxUses}`, inline: true },
-        { name: 'Max Age (minutes)', value: `${fetchedInvite.maxAge/60}`, inline: true },
-        { name: 'Temporary', value: `${fetchedInvite.temporary}`, inline: true }
+        { name: 'Uses', value: usesText, inline: true },
+        { name: 'Max Age (minutes)', value: maxAgeText, inline: true },
+        { name: 'Temporary', value: tempText, inline: true }
       )
       .setTimestamp()
       .setFooter({ text: 'Server Log' });
 
     await sendLogMessage(logChannelId, logEmbed);
+    // Keep invite cache fresh
+    try { await updateInviteCache(invite.guild); } catch (e) { console.error('Error updating invite cache after create:', e); }
   } catch (error) {
     console.error('Error during guildInviteCreate logging:', error);
   }
 });
 
-client.on('guildInviteDelete', async invite => {
-  inviteCache.delete(invite.code);
+client.on('inviteDelete', async invite => {
+  const map = inviteCache.get(invite.guild.id);
+  if (map) {
+    map.delete(invite.code);
+    inviteCache.set(invite.guild.id, map);
+  }
   try {
     const logEmbed = new EmbedBuilder()
       .setColor('#FF0000')
       .setTitle('Channel Activity')
       .addFields(
         { name: 'Type', value: 'Invite Delete', inline: true },
-        { name: 'Channel Name', value: `${invite.channel.name}`, inline: true },
-        { name: 'Channel Id', value: `${invite.channel.id}`, inline: true },
+        { name: 'Channel', value: `<#${invite.channel.id}>`, inline: true },
         { name: 'Invite Code', value: invite.code || 'Unknown', inline: true }
       )
       .setTimestamp()
       .setFooter({ text: 'Server Log' });
 
     await sendLogMessage(logChannelId, logEmbed);
+    // Keep invite cache fresh
+    try { await updateInviteCache(invite.guild); } catch (e) { console.error('Error updating invite cache after delete:', e); }
   } catch (error) {
     console.error('Error during guildInviteDelete logging:', error);
   }
@@ -1095,36 +1423,142 @@ client.on('guildMemberAdd', async member => {
     const avatarURL = user.displayAvatarURL({ dynamic: true, size: 512 });
     let joinedViaInvite = 'Unknown';
     let inviterTag = 'Unknown';
+    try {
+      const muteRole = member.guild.roles.cache.find(role => role.name === MUTE_ROLE_NAME);
+      let shouldReapplyMute = false;
+      const history = punishmentHistory.get(user.id) || [];
+      const reversed = [...history].reverse();
+      const lastMute = reversed.find(r => r.type === 'Mute');
+      if (lastMute) {
+        const lastUnmute = reversed.find(r => r.type === 'Unmute');
+        const unmutedAfterMute = lastUnmute && lastUnmute.timestamp > lastMute.timestamp;
+        if (!unmutedAfterMute) {
+          if (!lastMute.duration) {
+            shouldReapplyMute = true;
+          } else {
+            const endAt = new Date(lastMute.timestamp).getTime() + lastMute.duration * 24 * 60 * 60 * 1000;
+            if (Date.now() < endAt) shouldReapplyMute = true;
+          }
+        }
+      }
+      if (muteRole && shouldReapplyMute) {
+        const me = member.guild.members.me;
+        const canManage = me && me.permissions.has(PermissionsBitField.Flags.ManageRoles) && muteRole.comparePositionTo(me.roles.highest) < 0 && member.manageable;
+        if (canManage && !member.roles.cache.has(muteRole.id)) {
+          await member.roles.add(muteRole).catch(() => {});
+          mutedUsers.add(user.id);
+          // Schedule automatic unmute if the original mute was time-bound
+          if (lastMute && lastMute.duration) {
+            const endAt = new Date(lastMute.timestamp).getTime() + lastMute.duration * 24 * 60 * 60 * 1000;
+            const msLeft = endAt - Date.now();
+            if (msLeft > 0) {
+              setTimeout(async () => {
+                try {
+                  if (mutedUsers.has(user.id)) {
+                    await member.roles.remove(muteRole);
+                    mutedUsers.delete(user.id);
+                    if (logChannelId) {
+                      const unmuteLogEmbed = createLogEmbed(null, 'Mute Removed', '#008000', [
+                        { name: 'User', value: `<@${user.id}> ${user.username} Mute Removed (Automatic)` },
+                      ]);
+                      await sendLogMessage(logChannelId, unmuteLogEmbed);
+                      const autoUnmuteDmEmbed = new EmbedBuilder()
+                        .setColor('#008000')
+                        .setTitle('Automatic Unmute')
+                        .setDescription('Your mute was automatically removed.');
+                      sendDmEmbed(user, autoUnmuteDmEmbed);
+                    }
+                  }
+                } catch (error) {
+                  console.error('Error during automatic unmute (rejoin):', error);
+                }
+              }, msLeft);
+            }
+          }
+        }
+      } else if (!shouldReapplyMute && mutedUsers.has(user.id)) {
+        mutedUsers.delete(user.id);
+      }
+    } catch {}
 
-    await member.guild.invites.cache.clear();
-    const initialFreshInvites = await member.guild.invites.fetch({ cache: false });
+    // Snapshot previous invites for this guild from our cache (populated on ready/create/delete)
+    const previousInvites = new Map(inviteCache.get(member.guild.id) || new Map());
+    let inviterId = null;
 
     setTimeout(async () => {
-      const delayedFreshInvites = await member.guild.invites.fetch({ cache: false });
-      const usedInvite = fetchUsedInvite(initialFreshInvites, delayedFreshInvites);
+      let delayedFreshInvites = null;
+      try {
+        delayedFreshInvites = await member.guild.invites.fetch({ cache: false });
+        let usedInvite = fetchUsedInvite(previousInvites, delayedFreshInvites);
 
-      if (usedInvite) {
-        joinedViaInvite = usedInvite.code;
-        inviterTag = usedInvite.inviter.tag;
-      } else {
-        joinedViaInvite = 'Unknown';
-        inviterTag = 'Unknown';
+        if (usedInvite) {
+          joinedViaInvite = usedInvite.code;
+          inviterTag = usedInvite.inviter ? usedInvite.inviter.tag : 'Unknown';
+          inviterId = usedInvite.inviter ? usedInvite.inviter.id : null;
+        } else {
+          // Try detect single-use/deleted invite (present before, gone now)
+          let disappearedPrev = null;
+          try {
+            for (const [code, prev] of previousInvites.entries()) {
+              if (prev.guild && prev.guild.id === member.guild.id && !delayedFreshInvites.has(code)) {
+                disappearedPrev = prev;
+                break;
+              }
+            }
+          } catch {}
+          if (disappearedPrev) {
+            joinedViaInvite = disappearedPrev.code;
+            inviterTag = disappearedPrev.inviter ? disappearedPrev.inviter.tag : 'Unknown';
+            inviterId = disappearedPrev.inviter ? disappearedPrev.inviter.id : null;
+          } else {
+            // Fallback: try vanity URL
+            try {
+              const vanity = await member.guild.fetchVanityData();
+              if (vanity && vanity.code) {
+                joinedViaInvite = `Vanity: ${vanity.code}`;
+                inviterTag = 'Vanity URL';
+              } else {
+                joinedViaInvite = 'Unknown';
+                inviterTag = 'Unknown';
+              }
+            } catch {
+              joinedViaInvite = 'Unknown';
+              inviterTag = 'Unknown';
+            }
+          }
+        }
+      } catch (e) {
+        console.error('Error fetching delayed invites on member join:', e);
       }
 
-      await updateInviteCache(member.guild);
+      let inviterUses = 0;
+      if (inviterId && delayedFreshInvites) {
+        try {
+          delayedFreshInvites.forEach(inv => {
+            if (inv.inviter && inv.inviter.id === inviterId) inviterUses += inv.uses || 0;
+          });
+        } catch {}
+      }
+
+      // Save for use on member leave
+      try {
+        memberJoinInviteMap.set(user.id, { joinedViaInvite, inviterId, inviterTag });
+      } catch {}
+
+      try { await updateInviteCache(member.guild); } catch (e) { console.error('Error updating invite cache after member join:', e); }
 
       const logEmbed = new EmbedBuilder()
         .setColor('#00FF00')
-        .setTitle('Member Activity')
+        .setTitle('Member Activity- Join')
         .setThumbnail(avatarURL)
         .addFields(
           { name: 'Type', value: 'Member Join', inline: true },
-          { name: 'User Tag', value: `${user.tag}`, inline: true },
+          { name: 'User Tag', value: `<@${user.id}> ${user.tag}`, inline: true },
           { name: 'User Id', value: `${user.id}`, inline: true },
           { name: 'Account Created', value: `${member.user.createdAt.toLocaleDateString()}`, inline: true },
           { name: 'Joined Server', value: `${new Date().toLocaleDateString()}`, inline: true },
           { name: 'Joined via Invite', value: joinedViaInvite, inline: true },
-          { name: 'Inviter', value: inviterTag, inline: true },
+          { name: 'Inviter', value: inviterId ? `<@${inviterId}> ${inviterTag} (${inviterUses})` : inviterTag, inline: true },
           { name: 'Banner', value: bannerURL || 'No Banner', inline: true },
           { name: 'Profile', value: avatarURL, inline: true }
         )
@@ -1134,17 +1568,43 @@ client.on('guildMemberAdd', async member => {
       await sendLogMessage(logChannelId, logEmbed);
 
       // Send Welcome DM - keep this part
+      const meMember = member.guild.members.me;
+      const embedColor = (meMember && meMember.displayHexColor && meMember.displayHexColor !== '#000000') ? meMember.displayHexColor : '#00FF00';
+      const now = new Date();
+      const formattedTime = now.toLocaleTimeString('en-US', { hour: 'numeric', minute: '2-digit' });
       const welcomeEmbed = new EmbedBuilder()
-        .setColor('#00FF00')
-        .setTitle(`به سرور ${member.guild.name} خوش آمدید!`)
-        .setDescription(`از پیوستن شما به جمع ما خوشحالیم. برای دسترسی به تمام بخش‌های سرور، قوانین را مطالعه کنید و نقش‌های مورد علاقه خود را انتخاب کنید.`); // Customize welcome message
-      const dmResult = await sendDmEmbed(user, welcomeEmbed);
+        .setColor(embedColor)
+        .setTitle('Welcome to never give up!')
+        .setDescription("We're glad to have you here. Please read the rules and choose your roles to access all server sections.")
+        .setTimestamp(); // Customize welcome message
+      let joinUrl = null;
+      let targetChannelId = member.guild.rulesChannelId || member.guild.systemChannelId || null;
+      if (!targetChannelId) {
+        try {
+          const fallbackChannel = member.guild.channels.cache.find(ch => typeof ch.isTextBased === 'function' && ch.isTextBased() && ch.viewable);
+          if (fallbackChannel) targetChannelId = fallbackChannel.id;
+        } catch {}
+      }
+      if (targetChannelId) {
+        joinUrl = `https://discord.com/channels/${member.guild.id}/${targetChannelId}`;
+      } else {
+        try {
+          const vanity = await member.guild.fetchVanityData();
+          if (vanity && vanity.code) {
+            joinUrl = `https://discord.gg/${vanity.code}`;
+          }
+        } catch {}
+      }
+      const components = joinUrl ? [new ActionRowBuilder().addComponents(
+        new ButtonBuilder().setLabel('Join Channel').setStyle(ButtonStyle.Link).setURL(joinUrl)
+      )] : [];
+      const dmResult = await sendDmEmbed(user, welcomeEmbed, components);
       if (dmResult === null) {
         if (logChannelId) {
           const dmBlockedEmbed = new EmbedBuilder()
             .setColor('#FFA500')
             .setTitle('Welcome DM Blocked')
-            .setDescription(`پیام خوش آمدگویی به ${user.tag} (${user.id}) به دلیل تنظیمات حریم خصوصی کاربر ارسال نشد.`);
+            .setDescription(`The welcome DM to <@${user.id}> (${user.username}) was not delivered due to user privacy settings.`);
           sendLogMessage(logChannelId, dmBlockedEmbed);
         }
       } else if (dmResult === true) {
@@ -1153,7 +1613,7 @@ client.on('guildMemberAdd', async member => {
       }
 
 
-    }, 7000); // Delay increased to 7000ms (7 seconds)
+    }, 6000); // Delay increased to 7000ms (6 seconds)
 
 
   } catch (error) {
@@ -1166,20 +1626,45 @@ client.on('guildMemberRemove', async member => {
     const avatarURL = member.user.displayAvatarURL({ dynamic: true, size: 512 });
     let joinedViaInvite = 'Unknown';
     let inviterTag = 'Unknown';
+    let inviterId = null;
+
+    // Try to use stored data from when the member joined
+    try {
+      const saved = memberJoinInviteMap.get(member.user.id);
+      if (saved) {
+        joinedViaInvite = saved.joinedViaInvite || joinedViaInvite;
+        inviterTag = saved.inviterTag || inviterTag;
+        inviterId = saved.inviterId || null;
+        memberJoinInviteMap.delete(member.user.id);
+      }
+    } catch {}
+
+    // Recalculate total uses for inviter if available
+    let inviterUses = 0;
+    if (inviterId) {
+      try {
+        const freshInvites = await member.guild.invites.fetch({ cache: false });
+        freshInvites.forEach(inv => {
+          if (inv.inviter && inv.inviter.id === inviterId) inviterUses += inv.uses || 0;
+        });
+      } catch (e) {
+        console.error('Error fetching invites on member leave:', e);
+      }
+    }
 
     const logEmbed = new EmbedBuilder()
       .setColor('#FF0000')
-      .setTitle('Member Activity')
+      .setTitle('Member Activity - Leave')
       .setThumbnail(avatarURL)
       .addFields(
         { name: 'Type', value: 'Member Leave', inline: true },
-        { name: 'User Tag', value: `${member.user.tag}`, inline: true },
+        { name: 'User Tag', value: `<@${member.user.id}> ${member.user.tag}`, inline: true },
         { name: 'User Id', value: `${member.user.id}`, inline: true },
         { name: 'Joined Server', value: `${member.joinedAt.toLocaleDateString()}`, inline: true },
         { name: 'Left Server', value: `${new Date().toLocaleDateString()}`, inline: true },
         { name: 'Profile', value: avatarURL, inline: true },
         { name: 'Joined via Invite', value: joinedViaInvite, inline: true },
-        { name: 'Inviter', value: inviterTag, inline: true }
+        { name: 'Inviter', value: inviterId ? `<@${inviterId}> ${inviterTag} (${inviterUses})` : inviterTag, inline: true }
       )
       .setTimestamp()
       .setFooter({ text: 'Server Log' });
@@ -1207,10 +1692,11 @@ function fetchUsedInvite(initialFreshInvites, delayedFreshInvites) {
 async function updateInviteCache(guild) {
   try {
     const fetchedInvites = await guild.invites.fetch({ cache: false });
-    inviteCache.clear();
+    const map = new Map();
     fetchedInvites.forEach(invite => {
-      inviteCache.set(invite.code, invite);
+      map.set(invite.code, invite);
     });
+    inviteCache.set(guild.id, map);
   } catch (error) {
     console.error('Error updating invite cache:', error);
   }
@@ -1221,7 +1707,15 @@ function loadPunishments() {
   if (fs.existsSync(PUNISHMENTS_FILE)) {
     try {
       const data = fs.readFileSync(PUNISHMENTS_FILE, 'utf8');
-      return new Map(JSON.parse(data));
+      const parsed = JSON.parse(data); // [[userId, [records...]], ...]
+      const revived = parsed.map(([userId, records]) => [
+        userId,
+        (records || []).map(r => ({
+          ...r,
+          timestamp: new Date(r.timestamp),
+        })),
+      ]);
+      return new Map(revived);
     } catch (e) {
       console.error('Error reading punishments file:', e);
       return new Map();
@@ -1245,12 +1739,19 @@ client.on('ready', async () => {
   console.log('Log Channel ID on ready:', logChannelId);
   await registerCommands();
   client.user.setPresence({
-    status: 'idle', // You can change the status to 'online', 'dnd', 'idle', or 'invisible'
+    status: 'online', // You can change the status to 'online', 'dnd', 'idle', or 'invisible'
     activities: [{
-      name: 'TeaR',
+      name: '',
       type: ActivityType.Playing, // You can change the activity type to 'Playing', 'Streaming', 'Listening', 'Watching', or 'Custom'
     }],
   });
+  // Prime invite cache for all guilds
+  try {
+    const guilds = Array.from(client.guilds.cache.values());
+    await Promise.all(guilds.map(g => updateInviteCache(g)));
+  } catch (e) {
+    console.error('Error priming invite cache on ready:', e);
+  }
 });
 
 
